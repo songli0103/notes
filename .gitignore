@@ -1,0 +1,13 @@
+# Obsidian 设备相关 / 缓存（不同设备会冲突，不提交）
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/workspace.json.bak
+.obsidian/cache
+.obsidian/workspace-cache
+
+# 回收站
+.trash/
+
+# 系统
+.DS_Store
+Thumbs.db
