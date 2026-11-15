@@ -11,3 +11,6 @@
 # 系统
 .DS_Store
 Thumbs.db
+
+# WorkBuddy 会话数据（工作区指向本目录时会生成，不提交）
+.workbuddy/
