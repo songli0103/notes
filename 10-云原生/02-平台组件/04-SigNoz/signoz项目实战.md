@@ -78,7 +78,7 @@ flowchart LR
 2. **指标 preset 全关**：hostMetrics/kubeletMetrics/clusterMetrics 均 false，指标是 KPS 的活；
 3. **黑名单**：kube-system、SigNoz 自身、hotrod/locust 测试 Pod；otel-agent 容忍全部污点。
 
-已知局限：Events 单副本 Recreate 更新**有采集空窗，不保证停机补采**（README 明示）。
+
 
 ## 四、加工：前端不能改，就在采集侧提升
 

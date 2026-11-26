@@ -1,565 +1,324 @@
-# Centrifugo 学习笔记：实时消息层的架构与实践
+---
+tags:
+  - 平台组件
+  - centrifugo
+  - 实时消息
+  - SSE
+  - 教学
+created: 2026-11-26
+---
 
-> 基于 Centrifugo v6 官方文档整理，重点是架构边界、消息可靠性、横向扩展和生产落地。示例中的密钥只用于本地实验，生产环境应通过 Secret 或环境变量注入，并固定到经过验证的精确版本。
+# 📡 Centrifugo
 
-## 1. 先建立正确的定位
+> 问题驱动：**痛点 → Centrifugo 管什么/不管什么 → 架构思想 → 完整数据流 → 能力边界 → 最小实战 → 集群与排障**。项目用法（NAT 穿透门铃/隧道/presence 门禁）见 [[Centrifugo项目实战]]。
+> 基于 Centrifugo v5 官方文档整理，与项目部署版本 v5.4.0 对齐；实战按文档编写、未实际验证，示例密钥仅限本地。
 
-Centrifugo 是一个独立的实时消息服务器：它替业务系统维护大量长连接，按 channel 管理订阅，并把事件高效广播给在线客户端。WebSocket 是主要传输方式，也支持 HTTP-streaming、SSE 等传输。
+## 一、现状痛点
 
-它最适合放在 **业务后端与终端之间，作为实时传输层**，而不是替代业务后端、数据库或可靠消息队列。
+业务要"服务端事件实时到浏览器/agent"，自研 WebSocket 服务会撞上四件事：
 
-| 关注点 | 应由谁负责 |
-| --- | --- |
-| 用户登录、资源授权、参数校验 | 业务后端；JWT 或 proxy 是集成手段 |
-| 业务事务、长期保存、完整历史 | 业务数据库 |
-| 持久连接、订阅管理、在线广播 | Centrifugo |
-| 跨 Centrifugo 节点传播、短期历史和在线状态 | Engine / Broker / Presence Manager |
-| 必须可靠执行的业务事件投递 | Outbox、CDC、队列等机制与 Centrifugo 配合 |
+1. **扩容即丢消息**：连接散在多个 Pod，发布打到 Pod B，Pod A 上的客户端收不到——跨节点广播得自研；
+2. **断线即丢消息**：重连后断开期间的消息无处补——每频道历史 + 偏移量补发得自研；
+3. **鉴权与频道权限**：谁能连、谁能订哪个频道——token 校验与频道 ACL 得自研；
+4. **保活与在线状态**：心跳、超时、谁在线——ping/pong 与 presence 得自研。
 
-最重要的架构原则：
+归纳：**连接基础设施与业务无关，却件件要写对**。Centrifugo 就是把这四件整体外包的现成服务端。
 
-> **数据库是事实源，Centrifugo 历史是短期恢复缓存，客户端必须能够重新拉取完整状态。**
+## 二、Centrifugo：管"连接 → 频道 → 送达"，不管业务语义
 
-这样即使实时链路暂时不可用，普通业务 API 仍然可用，只是页面不再实时刷新。
-
-## 2. 核心概念与关系
-
-- **User**：业务用户身份，通常来自连接 JWT 的 `sub`。
-- **Client / Connection**：一条实际连接。一个用户打开多个浏览器标签页，会产生多个 client。
-- **Channel**：消息通道，本质上是一个字符串，例如 `orders:42`。
-- **Namespace**：一组 channel 的共同配置。`orders:42` 使用名为 `orders` 的 namespace；发布和订阅必须使用完整且完全相同的 channel 名。
-- **Publication**：发布到 channel 的一条消息。
-- **Engine**：节点间消息传播、历史和在线状态的核心实现，内部可拆成 Broker 与 Presence Manager。
-
-Channel 是临时对象：有订阅或历史需求时自然存在，不需要先执行“创建 channel”。Namespace 则必须提前配置，否则带该前缀的 channel 会报 `102: unknown channel`。
-
-## 3. 推荐的整体架构
+| 管 | 不管 |
+|---|---|
+| 长连接生命周期：WebSocket / SSE / HTTP-stream 接入、心跳保活 | 业务权限决策：谁可订哪个频道，由后端签 JWT 或 Proxy 回调决定 |
+| 频道 pub/sub 扇出、跨节点广播（engine） | 持久存储与消费语义：history 只是补发窗口，不是消息队列 |
+| 短窗口历史 + 重连恢复（offset/epoch） | 业务事件语义：房间、自定义 ack、请求/响应是应用层的事 |
+| 连接鉴权（JWT / connect proxy）、presence 在线查询 | 数据生产：消息内容由后端调 Publish 注入 |
 
 ```mermaid
 flowchart LR
-    subgraph Clients
-        Browser[Browser]
-        Mobile[Mobile App]
+    B["后端业务"] -->|"Server API: Publish"| CF["Centrifugo 集群"]
+    B -->|"签发连接 JWT"| C["客户端 SDK"]
+    C -->|"长连接 + 订阅"| CF
+    CF -->|"publication 推送"| C
+```
+
+**后端只"喊一嗓子"，不持有任何连接**；消息落库、权限模型、失败对账仍在后端。痛点 1/2 由 engine + history 回应，3/4 由鉴权 + presence 回应。
+
+### 卖点：为什么是它
+
+| 卖点 | 具体 | 对照 |
+|---|---|---|
+| 语言无关 | 独立 Go 服务，后端任意语言走 HTTP/gRPC 发布；客户端 SDK 覆盖 JS/Go/Python/Java/Dart 等 | 不锁 Node（Socket.IO） |
+| 连接设施内置 | presence/history/recovery/心跳开箱即用 | 省去 §一 四件自研 |
+| 水平扩展 | redis engine 跨节点广播，连接数随节点扩 | 自研跨 Pod 广播难写对 |
+| 多协议穿透 | WebSocket/SSE/HTTP-stream + 单向族，适配受限网络 | NAT/防火墙后仍可达（§3.6） |
+| 自托管开源 | MIT 许可，数据不出网 | 私有化友好（vs Pusher SaaS） |
+
+一句话：**把"连接基础设施"做成语言无关、可水平扩展的独立服务**——这是它相对自研与同类库的根本卖点。
+
+## 三、架构思想
+
+### 3.1 连接层与业务层分离
+
+后端 ↔ Centrifugo 是**无状态 Server API**（HTTP `/api/<method>` + `X-API-Key`，或 gRPC）；Centrifugo ↔ 客户端才是有状态长连接。后端扩容不牵扯连接迁移，连接层扩容不牵扯业务代码。
+
+### 3.2 频道是路由单位，namespace 是策略单位
+
+频道只是一个字符串，首个订阅者出现时自动创建、末个离开时清理，**无需预建**。history/presence/订阅权限按 namespace 配置，不全局一刀切。
+
+| 符号 | 含义 | 例 |
+|---|---|---|
+| `:` | namespace 边界，策略取自该 namespace | `chat:index` → namespace `chat` |
+| `#` | 用户边界（user-limited），仅列出的用户可订 | `news#42` 仅用户 42 |
+| `$` | 私有频道前缀，需订阅 token | `$secret` |
+
+**发布必须用与订阅完全相同的字符串**：订 `chat:index` 却发 `index`，消息到不了——namespace 不会被剥掉。
+
+### 3.3 engine：单机与集群的分界
+
+| engine | 跨节点广播 | history 持久性 | 适用 |
+|---|---|---|---|
+| memory（默认） | ❌ 单节点 | 节点重启即失 | 开发/单 Pod |
+| redis | ✅ | 取决于 Redis 配置 | **多副本必选** |
+
+v5 另有 tarantool engine，较少用；多副本换分布式 engine 即可，常用 redis。
+
+### 3.4 鉴权两种姿态
+
+| | JWT 预授权 | Proxy 动态鉴权 |
+|---|---|---|
+| 决策时机 | 签发时写死 | connect/subscribe/publish/refresh 每次反调后端 |
+| 后端要做什么 | HS256 签 `{sub, exp, subs}` | 实现回调端点 |
+| 权限变更 | 重签 token | 即时生效 |
+| 代价 | 变更不即时 | 多一跳回调 |
+
+`sub` 是用户 ID；`subs` 是**服务端订阅**——连接建立即自动订上写死的频道（`subs` ≠ 权限列表）。客户端能否再自选频道，另由 namespace `allow_subscribe_for_client` / subscribe proxy 决定；项目把订阅写死在 token、关死自选，才做到"频道不可自选"。
+
+Proxy 时机还含 `rpc`：Centrifugo 可把客户端 RPC 请求转发后端（只是传输壳，业务逻辑仍在后端）；项目未用原生 RPC，自研隧道（见 [[Centrifugo项目实战]]）。
+
+### 3.5 送达语义：默认尽力而为，恢复是可选增强
+
+默认 pub/sub **at-most-once**：客户端不在就错过，无 ack。两个增强开关（都必须配 `history_size`/`history_ttl`）：
+
+- `force_positioning`：用 history 校验客户端 offset，发现潜在丢失即以 Insufficient state 断开；
+- `force_recovery`：重连时按 offset+epoch 从 history 补发；应用要容忍重复消息。
+
+客户端 SDK 内置**自动重连**与 **token 刷新**（`getToken` 回调），断线恢复不用业务手写。
+
+### 3.6 传输协议族：双向 vs 单向
+
+| 族 | 协议 | 端点 | 默认 |
+|---|---|---|---|
+| 双向 | WebSocket | `/connection/websocket` | **开** |
+| 双向 | HTTP-streaming | `/connection/http_stream` | 关 |
+| 双向 | SSE/EventSource 模拟 | `/connection/sse` | 关 |
+| 双向 | SockJS（旧浏览器 polyfill） | `/connection/sockjs` | 关 |
+| 单向 | uni_sse | `/connection/uni_sse` | 关 |
+| 单向 | uni_http_stream | `/connection/uni_http_stream` | 关 |
+| 单向 | uni_websocket | `/connection/uni_websocket` | 关 |
+
+- **双向**：一条连接收发都走它；
+- **单向（v5 新增）**：下行用该协议推，**上行另走 HTTP POST**（emulation 端点）——把"一条连接双向"拆成"下行推送 + 上行独立请求"。
+
+取舍在**穿透性**：WebSocket 可能被中间代理拦截或缓冲；SSE 是普通 HTTP（`text/event-stream`），穿透 NAT/防火墙/代理最好。项目选 `uni_sse` 正是为此（客户集群在 NAT 后）。默认只开 WebSocket，其余按需 enable；SDK 按 URL 端点自动选传输，业务代码不变。
+
+## 四、完整数据流：发布 → 集群 → 订阅
+
+图只画拓扑与方向；组件职责见下表。
+
+```mermaid
+flowchart TB
+    subgraph BE["后端"]
+        API["业务服务"]
     end
-
-    LB[Ingress / Load Balancer]
-
-    subgraph Realtime[Centrifugo 集群]
-        C1[Centrifugo Node 1]
-        C2[Centrifugo Node 2]
+    subgraph CF["Centrifugo 集群"]
+        N1["节点 A"]
+        N2["节点 B"]
+        R[("Redis engine")]
+        N1 --- R
+        N2 --- R
     end
-
-    Redis[(Redis Engine\nPUB/SUB + History + Presence)]
-    App[业务后端]
-    DB[(业务数据库\nSource of Truth)]
-    Queue[Outbox / Queue / CDC\n可选]
-
-    Browser <-->|WebSocket / SSE / HTTP-streaming| LB
-    Mobile <-->|WebSocket| LB
-    LB --> C1
-    LB --> C2
-    C1 <--> Redis
-    C2 <--> Redis
-
-    App -->|1. 签发连接/订阅 JWT| Browser
-    App -->|2. 校验并写入业务数据| DB
-    App -->|3a. HTTP / gRPC Server API| C1
-    App -->|3b. 可靠异步投递| Queue
-    Queue --> C2
-    C1 -.可选：connect/subscribe/publish proxy.-> App
+    subgraph CL["客户端"]
+        SDK["SDK 长连接"]
+    end
+    API -->|"Publish / presence"| N2
+    SDK -->|"connect + subscribe"| N1
+    N1 -->|"publication"| SDK
 ```
 
-### 3.1 两条主要链路
+一条消息的完整旅程（含鉴权与重连恢复）：
 
-**连接链路**
-
-1. 客户端先向业务后端请求实时连接凭证。
-2. 后端识别用户并签发带 `sub`、`exp` 的 JWT。
-3. 客户端通过 SDK 连接 Centrifugo，并订阅 channel。
-4. Centrifugo 验签、鉴权，SDK 负责后续重连、重订阅和令牌刷新。
-
-**消息链路**
-
-1. 客户端的业务写操作仍走普通业务 API。
-2. 后端完成鉴权、参数校验和数据库事务。
-3. 后端调用 Centrifugo Server API，或通过 Outbox / 队列异步投递。
-4. 收到 API 的节点通过 Broker 传播事件。
-5. 持有对应订阅的节点把事件写入各自客户端连接。
-
-不要让浏览器直接持有 API Key 调用 Server API，也不要因为已经使用 WebSocket，就把所有业务请求都迁移到实时连接上。
-
-### 3.2 为什么默认采用“后端发布”
-
-- 业务数据先落库，再发送实时通知，职责清晰。
-- 客户端不能绕过业务校验向 channel 写任意内容。
-- 权限、限流、审计仍集中在业务后端。
-- 发起操作的客户可以直接使用 HTTP 响应更新 UI，不必等待自己的实时消息回环；通过 `event_id` 去重即可。
-
-客户端直接 publish 仍有价值，例如“正在输入”等不需要持久化的临时信号；涉及业务事实时应使用 publish proxy 或回到业务 API。
-
-## 4. Engine：单节点与多节点的关键差别
-
-Engine 可理解为两个能力的组合：
-
-- **Broker**：节点发现、跨节点 PUB/SUB、channel 发布与历史流。
-- **Presence Manager**：在线状态的增删查。
-
-| 方案 | 多节点广播 | 历史与恢复 | 适用场景与限制 |
-| --- | --- | --- | --- |
-| `memory` | 不支持常规跨节点广播 | 支持，但重启即丢失 | 本地开发、单实例；最简单且没有额外网络开销 |
-| `redis` | 支持 | 支持，数据在 Redis；持久性取决于 Redis 自身配置 | 通用生产方案；需要运维 Redis，并考虑其高可用 |
-| 独立 `nats` Broker | 支持 | 不支持 Centrifugo history / recovery | 只需要 at-most-once PUB/SUB，或已有 NATS 体系 |
-
-Redis Engine 下，客户端可连接任意节点，后端也可向任意节点发布；Redis PUB/SUB 会把消息送到真正持有订阅者的节点。**因此不需要把同一用户的连接黏固定到某个 Centrifugo 节点。**
-
-进一步拆分 Broker 与 Presence Manager，可以分别扩缩容或隔离负载。例如 NATS 负责广播、Redis 负责 presence。但只有 Redis 等支持历史的 Broker 才能提供完整的恢复能力。
-
-Redis 成为瓶颈时，可考虑：
-
-- 多个独立 Redis 实例间的一致性分片；
-- Redis Cluster；
-- 将 Broker 与 Presence Manager 拆到不同 Redis；
-- 先通过指标确认瓶颈，不要一开始就把拓扑复杂化。
-
-## 5. 消息语义：可靠性不是“开一个历史开关”就结束
-
-### 5.1 投递与顺序
-
-| 维度 | 语义 |
-| --- | --- |
-| 默认投递 | at-most-once，在线推送阶段可能丢失 |
-| 开启 history + positioning / recovery | 在历史窗口内可达到 at-least-once 的恢复效果 |
-| 超出窗口、流已丢失 | 不做部分恢复，客户端必须回源加载状态 |
-| 同一 channel 顺序 | 串行发布或同一请求内发布可保证顺序；并发发布不保证先后 |
-| 跨 channel 顺序 | 不应依赖 |
-| 离线长期投递 | 不属于 Centrifugo 历史流的目标 |
-
-即使开启 recovery，业务事件和客户端处理仍应幂等，因为重试、Outbox、网络超时都可能制造重复。
-
-### 5.2 `offset`、`epoch` 与恢复流程
-
-开启历史后，每个 channel 有一个有界、有序的近期消息流：
-
-- `history_size`：最多保留多少条；
-- `history_ttl`：最多保留多久；
-- **二者都必须大于 0，历史才真正启用**；
-- `offset`：消息在流中的递增位置；
-- `epoch`：当前流的身份。流被清空或重建后，即使 `offset` 数字相同，也已经不是同一条流。
-
-双向 SDK 会自动完成以下过程：
-
-1. 订阅成功时记录 `epoch + offset`。
-2. 每收到一条 publication，就推进本地位置。
-3. 断线重连后，携带上次位置重新订阅。
-4. 如果缺失消息仍完整存在，Centrifugo 按序补发，`recovered: true`。
-5. 如果 `epoch` 改变、消息过期或被挤出，则 `recovered: false`，客户端回源加载完整状态。
-
-`force_recovery: true` 会同时启用 positioning。Positioning 还能发现“连接看似正常、实际位置已经出现缺口”的情况，并促使客户端重连恢复。
-
-```javascript
-sub.on('subscribed', async (ctx) => {
-  if (ctx.wasRecovering && !ctx.recovered) {
-    // 不能确认连续性：从业务后端重新加载，而不是假装没有丢消息。
-    await loadOrderFromBackend();
-  }
-});
+```mermaid
+sequenceDiagram
+    participant B as 后端
+    participant C as 客户端 SDK
+    participant A as 节点 A
+    participant R as Redis engine
+    participant BB as 节点 B
+    B->>C: ① 签发 JWT(sub/exp/subs)
+    C->>A: ② connect 携带 token, 验 HMAC
+    A->>A: ③ 订阅权限校验(subs / namespace / proxy)
+    B->>BB: ④ POST /api/publish (X-API-Key)
+    BB->>R: ⑤ 跨节点广播
+    R->>A: ⑤ 投到持有连接的节点
+    A->>C: ⑥ publication 推送
+    C--xA: ⑦ 断线后重连, 携带 offset+epoch
+    A->>C: ⑧ 窗口内补发, 超窗恢复失败则业务对账
 ```
 
-注意：`wasRecovering` 只表示客户端尝试恢复；真正需要回源的重要信号是 `wasRecovering && !recovered`。
+| 组件 | 职责 |
+|---|---|
+| Server API | 后端入口，HTTP/gRPC + key 鉴权（方法见下表） |
+| engine | 跨节点广播 + history 存储；memory 单机 / redis 集群 |
+| 频道/订阅管理 | 字符串 → 订阅者映射，扇出推送 |
+| presence | 频道在线连接信息，供后端做门禁/徽标 |
 
-### 5.3 Stream 与 Cache 两种恢复模式
+Server API 常用方法（后端经 `X-API-Key` 调用，HTTP `/api/<method>` 或 gRPC）：
 
-- `stream`：默认模式，补发所有缺失事件，适合聊天、操作日志、订单状态变更。
-- `cache`：只补最新状态，适合行情、仪表盘、完整快照；常配合 `history_size: 1`。
+| 方法 | 用途 |
+|---|---|
+| publish | 向单个频道发消息 |
+| broadcast | 同一数据高效发往多个频道 |
+| subscribe / unsubscribe | 服务端把某连接订上/退订某频道 |
+| disconnect | 服务端主动断开某连接/用户 |
+| presence / history | 查频道在线明细 / 查补发窗口历史 |
+| presence_stats | 轻量计数 `num_clients`/`num_users`，发布前门禁常用 |
+| refresh | 刷新连接凭据（配合 exp 续期） |
 
-历史流不是 Kafka 那样的长期事件日志，也不是离线邮箱。窗口大小应围绕“短时断网和集中重连”设计，而不是围绕“用户离线一周后补齐全部消息”设计。
+逐段风险：
 
-### 5.4 Presence 与 Join/Leave 的边界
+| 段 | 失败模式 | 兜底 |
+|---|---|---|
+| ② | 密钥不一致/过期 → 拒连 | 后端重签；SDK getToken 刷新 |
+| ③ | 未定义 namespace → `102 unknown channel` | 配置先定义 |
+| ④ | publish fire-and-forget，**无客户端 ack** | 关键回执走业务上行 |
+| ⑤ | memory engine 多副本 → 跨 Pod 丢 | 换 redis engine |
+| ⑧ | 断线超 history 窗口 → 补发不了 | 业务全量对账 |
 
-- Presence 是最终一致的；Redis 模式下节点异常退出后，残留状态可能要等 TTL 到期才消失。
-- 大 channel 不要频繁拉取完整 presence 快照；只需要人数时使用 `presence_stats`。
-- Join/Leave 会向订阅者广播。若一个有 N 个订阅者的 channel 同时发生 N 次上下线，可能形成约 N² 的消息放大，大规模房间应谨慎开启。
+## 五、能力边界：开箱 vs 必须配合
 
-## 6. 认证与授权：连接成功不代表能订阅任意频道
+| 能力 | 开箱 | 需改动 | 具体改动点 |
+|---|---|---|---|
+| 海量长连接接入 | ✅ | — | 选端点 `/connection/websocket` 或 `uni_sse` |
+| 跨节点广播 | ❌ | 配置 | `engine: redis` + Redis 地址 |
+| 频道权限 | ❌ | 后端 | 签 JWT 写 `subs`，或实现 subscribe proxy |
+| 断线补发 | ❌ | 配置 | namespace 开 `force_recovery` + history |
+| 在线状态 | ❌ | 配置 | `presence: true`，后端调 presence API |
+| 持久/回放/消费组 | ❌ | **不是它的活** | 落库 / [[Kafka]] |
 
-需要分别考虑四类客户端操作：**subscribe、publish、history、presence**。它们有各自的权限检查，不能只保护 subscribe 就默认其他操作也安全。
+对比同类（每个都写"选它的代价"）：
 
-### 6.1 两种常见集成方式
+| 维度 | Centrifugo | Socket.IO | Kafka | Pusher |
+|---|---|---|---|---|
+| 形态 | 自托管连接总线 | Node 应用内库 | 持久日志 broker | SaaS 托管 |
+| 连接谁持有 | 独立服务 | 你的应用进程 | 消费者，非浏览器海量连接 | 厂商 |
+| 扩容/补发 | engine + history 内置 | 广播靠 adapter，补发自研 | 消费组+offset 天然回放 | 厂商内置 |
+| 业务语义 | 薄：频道 pub/sub | 厚：房间/ack/事件 | 厚：分区/消费组/事务 | 中：频道/事件 |
+| 选它的代价 | 鉴权要自己接、无持久消费 | 锁 Node、连接设施自研 | 不为前端长连接设计、运维重 | 数据出网、按量计费、无法私有化 |
 
-| 方式 | 优点 | 代价与适用场景 |
-| --- | --- | --- |
-| 连接 JWT + 订阅 JWT | Centrifugo 本地验签；集中重连时对后端压力小 | 后端需签发和刷新令牌；适合大多数生产系统 |
-| Connect / Subscribe Proxy | 每次事件都由后端动态决策，可复用 Session / Cookie | 热路径增加 HTTP/gRPC 调用、延迟和故障点；适合动态权限或已有会话体系 |
+**不该用**：要回放/消费组 → Kafka；要深度事件/ack 语义且栈是 Node → Socket.IO；零运维接受出网 → Pusher；分钟级低频通知 → 轮询就够。
 
-Proxy 支持 HTTP 和 gRPC，并可设置超时。若每次 subscribe / publish 都访问后端，该端点必须具备与实时流量相匹配的容量。JWT 更适合降低大规模重连时的认证后端压力。
+## 六、最小实战（v5.4.0）
 
-### 6.2 Channel 设计建议
-
-- 按业务语义划分 namespace，例如 `orders`、`notifications`、`presence`，不要给所有 channel 一套过宽配置。
-- 个人通知可用 user-limited channel：`personal:user#42`，并开启 `allow_user_limited_channels`。
-- `$` 私有前缀只限制订阅；history、presence、publish 仍需分别授权。
-- `allow_subscribe_for_client` 表示该 namespace 对所有已登录连接开放，不等于“仅允许资源所有者”。
-- 默认不要开放客户端 publish；有需求时优先使用 publish proxy 做校验。
-- 使用 `channel_regex` 限制客户端可订阅的命名空间内名称，减少意外暴露。
-- 对 JSON 业务消息可设置 `publication_data_format: "json_object"`，把格式错误挡在发布阶段。
-
-### 6.3 令牌实践
-
-- 后端签发 JWT，`sub` 是字符串形式的用户 ID。
-- 设置合理且较短的 `exp`，通过 SDK 的 `getToken` 刷新。
-- 配置 `issuer` 和 `audience`，避免给其他服务签发的令牌被误用。
-- 浏览器不能保存 HMAC 密钥；JWT 是签名而非加密，不要在 payload 放敏感明文。
-- 使用 Cookie + connect proxy 时，严格设置 `client.allowed_origins`，防止跨站 WebSocket 滥用。
-- Server API、Admin、Metrics 等端口应按网络边界暴露，不能随客户端连接端口一起公网开放。
-
-## 7. 本地实践：Redis Engine + 可恢复的订单频道
-
-下面用 `orders:42` 演示完整链路。该示例为了简化订阅，允许任意已认证用户订阅 `orders` namespace；**生产环境应改为订阅 JWT、subscribe proxy 或严格匹配的 user-limited channel。**
-
-### 7.1 `config.json`
-
-```json
-{
-  "client": {
-    "token": {
-      "hmac_secret_key": "local-only-change-me"
-    },
-    "allowed_origins": ["http://localhost:3000"]
-  },
-  "http_api": {
-    "key": "local-only-api-key"
-  },
-  "engine": {
-    "type": "redis",
-    "redis": {
-      "address": "redis://redis:6379"
-    }
-  },
-  "channel": {
-    "namespaces": [
-      {
-        "name": "orders",
-        "allow_subscribe_for_client": true,
-        "publication_data_format": "json_object",
-        "history_size": 100,
-        "history_ttl": "300s",
-        "force_recovery": true
-      }
-    ]
-  },
-  "prometheus": {
-    "enabled": true
-  }
-}
-```
-
-### 7.2 `compose.yaml`
-
-```yaml
-services:
-  centrifugo:
-    image: centrifugo/centrifugo:v6
-    command: centrifugo -c config.json
-    volumes:
-      - ./config.json:/centrifugo/config.json:ro
-    ports:
-      - "8000:8000"
-    depends_on:
-      - redis
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
-
-  redis:
-    image: redis:7-alpine
-    # 不映射到宿主机，只允许 Compose 内部网络访问。
-```
-
-启动并验证配置：
+### 6.1 起服务
 
 ```bash
-docker compose up -d
-docker compose exec centrifugo centrifugo checkconfig -c config.json
+docker run -d --name centrifugo -p 8000:8000 \
+  -e CENTRIFUGO_TOKEN_HMAC_SECRET_KEY=local-demo-secret \
+  -e CENTRIFUGO_API_KEY=local-demo-api-key \
+  -e CENTRIFUGO_ALLOWED_ORIGINS='*' \
+  -e CENTRIFUGO_NAMESPACES='[{"name":"demo","allow_subscribe_for_client":true,"presence":true,"history_size":10,"history_ttl":"300s","force_recovery":true}]' \
+  centrifugo/centrifugo:v5.4.0
 ```
 
-生成一个仅用于实验、1 小时有效的连接令牌：
+`allow_subscribe_for_client` 使 demo namespace 对已认证客户端开放订阅（**等于公开，生产用 subs 或 proxy**）。
+
+### 6.2 后端签连接 JWT
 
 ```bash
-docker compose exec centrifugo centrifugo gentoken -c config.json -u 42 -t 3600
+pip install pyjwt
+python3 -c "import jwt,time; print(jwt.encode({'sub':'demo-user','exp':int(time.time())+3600}, 'local-demo-secret', algorithm='HS256'))"
 ```
 
-### 7.3 浏览器连接与恢复处理
+### 6.3 前端订阅（centrifuge-js 5.4.0）
 
-安装 `centrifuge` 后，在来源为 `http://localhost:3000` 的前端中使用：
-
-```javascript
-import { Centrifuge } from 'centrifuge';
-
-const client = new Centrifuge('ws://localhost:8000/connection/websocket', {
-  token: '<上一步生成的 JWT>',
-  // 生产环境改为从业务后端获取，并处理 401/403：
-  // getToken: async () => (await fetch('/api/realtime/token')).json().then(x => x.token),
-});
-
-const seenEvents = new Set();
-const sub = client.newSubscription('orders:42');
-
-sub.on('publication', (ctx) => {
-  const event = ctx.data;
-  if (seenEvents.has(event.event_id)) return;
-  seenEvents.add(event.event_id);
-  applyOrderEvent(event);
-});
-
-sub.on('subscribed', async (ctx) => {
-  if (ctx.wasRecovering && !ctx.recovered) {
-    await loadOrderFromBackend();
-  }
-});
-
-sub.on('error', (ctx) => console.error('subscription error', ctx));
-client.on('error', (ctx) => console.error('client error', ctx));
-
-sub.subscribe();
-client.connect();
+```html
+<script src="https://unpkg.com/centrifuge@5.4.0/dist/centrifuge.js"></script>
+<script>
+  const centrifuge = new Centrifuge('ws://localhost:8000/connection/websocket', { token: '<6.2 输出>' });
+  const sub = centrifuge.newSubscription('demo:lobby');
+  sub.on('publication', ctx => console.log('收到', ctx.data));
+  sub.on('subscribed', ctx => console.log('recovered:', ctx.recovered));
+  sub.subscribe();
+  centrifuge.connect();
+</script>
 ```
 
-真实项目中还要限制 `seenEvents` 的容量，例如使用带 LRU 淘汰的缓存；事件处理器不要执行长时间阻塞操作。
-
-### 7.4 后端发布
+### 6.4 后端发一条频道消息
 
 ```bash
-curl --header "Content-Type: application/json" \
-  --header "X-API-Key: local-only-api-key" \
-  --request POST \
-  --data '{
-    "channel": "orders:42",
-    "idempotency_key": "order-42-version-8",
-    "data": {
-      "event_id": "order-42-version-8",
-      "order_id": "42",
-      "version": 8,
-      "type": "order.shipped",
-      "payload": {"status": "shipped"}
-    }
-  }' \
-  http://localhost:8000/api/publish
+curl -s http://localhost:8000/api/publish \
+  -H 'X-API-Key: local-demo-api-key' -H 'Content-Type: application/json' \
+  -d '{"channel":"demo:lobby","data":{"text":"hello"}}'
+# 预期: {"result":{}}   浏览器控制台: 收到 {text: 'hello'}
 ```
 
-建议统一事件信封：
+### 6.5 presence 与重连恢复
 
-```json
-{
-  "event_id": "全局稳定且可用于去重的 ID",
-  "type": "order.shipped",
-  "aggregate_id": "42",
-  "version": 8,
-  "occurred_at": "2026-11-23T08:00:00Z",
-  "payload": {}
-}
+```bash
+curl -s http://localhost:8000/api/presence \
+  -H 'X-API-Key: local-demo-api-key' -d '{"channel":"demo:lobby"}'
+# 预期: result.presence 含 user=demo-user 的条目
 ```
 
-实践要点：
+恢复验证：devtools 断网 → 再 publish 一条 → 恢复网络 → 先收到补发，`subscribed` 事件 `recovered: true`；断网超 300s 重连则恢复失败，需业务对账。
 
-1. 使用稳定 `event_id`，客户端或消费端幂等处理。
-2. 发布重试沿用相同 `idempotency_key`，不要在重试时生成新值。
-3. HTTP 200 不代表业务调用一定成功；默认模式下还要检查响应体是否包含 `error`。
-4. 为 API 调用设置超时、有限重试和抖动退避。
-5. `idempotency_key` 的重复抑制有期限和 Broker 适用范围，不等于永久的 exactly-once 保证；NATS Broker 会忽略它。
-6. 同 channel 需要严格顺序时，按聚合根串行发布，或使用能保证分区顺序的异步链路。
+## 七、进阶：集群与排障
 
-可以打开多个浏览器标签页验证广播；停网或重启 Centrifugo 后再恢复，观察 `subscribed` 上下文和补发消息。Memory 与 Redis 的历史持久性不同，Redis 本身重启后的数据是否仍在，也取决于 Redis 持久化配置。
+集群三要点：**多副本必须 redis engine**；公网入口常只放行 SSE 路径（`/connection/uni_sse`，普通 HTTP 穿透代理/防火墙最好，上行另走 HTTP）；**ping 间隔必须小于中间代理空闲超时**，否则静默断连。
 
-## 8. 业务写入与实时发布的可靠性设计
+可观测：`admin: true` 开内置 Web 管理面板（端口 8000，看节点/连接/频道），`prometheus: true` 暴露指标供 [[KPS 与 Keep]] 抓取。
 
-### 8.1 直接发布：简单但有双写窗口
+分层排障：
 
-常见顺序是：
-
-```text
-校验请求 → DB transaction commit → 调用 Centrifugo publish → 返回业务响应
+```mermaid
+flowchart TB
+    Q["实时消息不通"] --> A{哪一段?}
+    A -->|连不上| C1["JWT: HMAC 密钥一致? 过期?<br/>allowed_origins? 代理路径放行?"]
+    A -->|订不上| C2["namespace 定义了没(102)?<br/>allow_subscribe_for_client / subs / proxy?"]
+    A -->|订上收不到| C3["发布字符串与订阅一致?<br/>多副本 engine 是 redis?<br/>presence 查连接在不在"]
+    A -->|重连丢消息| C4["force_recovery + history 开了没?<br/>断线超窗口? 业务对账"]
 ```
 
-数据库提交后、实时发布前仍可能宕机，因此“数据库成功”不必然意味着“通知成功”。此外，不要在数据库提交前发布，否则订阅者可能收到一个最终回滚或尚不可见的变更。
+常见坑：
 
-直接发布适合：
+1. **memory engine 扩副本**：跨 Pod 消息互不可见，多副本必换 redis；
+2. **102 unknown channel**：用了未定义的 namespace；
+3. **发布字符串不一致**：订 `chat:index` 发 `index`，namespace 不剥掉；
+4. **HMAC 密钥多处不一致**：签发端与 `token_hmac_secret_key` 必须同值；
+5. **客户端订不上**：`allow_subscribe_for_client` 默认 false，未开且无 subs/proxy；
+6. **超窗丢消息**：history 窗口外恢复失败，业务对账兜底；
+7. **代理空闲断连**：ping 间隔 > 代理空闲超时；
+8. **把 history 当队列**：它只是补发窗口，持久消费归 [[Kafka]]。
 
-- 实时通知只是体验增强，丢失后重新加载即可；
-- 客户端有明确的回源机制；
-- 希望链路简单、延迟低。
+## 八、与项目形态的对照指引
 
-### 8.2 Outbox / CDC：让业务事实与待发布事件一起持久化
+| 本文机制 | 项目具体化 |
+|---|---|
+| JWT 预授权（§3.4） | agent token subs 写死 clusterCode；前端 `gpt:web-event#userid` 用户级频道 |
+| 单向 SSE（§3.6） | uni_sse 穿透 NAT，上行回连/隧道另走 HTTP（门铃/隧道模式） |
+| redis engine（§3.3） | 2 副本 + Redis engine 跨 Pod 广播 |
+| history 窗口（§3.5） | history_size 10 / history_ttl 300s，超窗业务对账 |
+| presence（§四） | GetNumClients 做发布前门禁与在线徽标 |
 
-对“业务变更最终必须产生实时事件”的场景：
+详见 [[Centrifugo项目实战]]。
 
-1. 在同一数据库事务中写业务表与 Outbox 表。
-2. 后台 worker 或 Centrifugo 内置 async consumer 读取事件。
-3. 调用同一套 publish / broadcast 逻辑。
-4. 使用幂等键和客户端去重吸收至少一次投递带来的重复。
+## 一句话总结
 
-Centrifugo v6 内置消费者可接 PostgreSQL Outbox、Kafka、NATS JetStream、Redis Stream 以及多种云队列。引入异步链路后，需要额外关注：
+**Centrifugo 是自托管的实时连接总线，接管"连接持有 → 频道路由 → 扇出送达 → 短窗补发"，不接管业务权限决策、持久消费与事件语义；适合想甩掉长连接基础设施的私有化实时推送，不适合要回放/消费组（Kafka）或零运维 SaaS（Pusher）。**
 
-- 消费滞后和重试；
-- 分区与 channel 的顺序关系；
-- 事件在业务操作之后较晚到达时，客户端是否应忽略旧版本；
-- Outbox 清理与监控。
+## 相关
 
-**选择依据不是“越可靠越好”，而是事件丢失的代价。** 普通在线提示可直接发布，交易状态或关键通知更适合 Outbox。
-
-## 9. 生产部署要点
-
-### 9.1 负载均衡与反向代理
-
-多节点 + Redis Engine 下通常无需 sticky session。L7 代理必须正确处理：
-
-- WebSocket `Upgrade` / `Connection` 头，并使用 HTTP/1.1 上游；
-- SSE、HTTP-streaming 关闭响应缓冲；
-- 放行 `/emulation`，它承载 SSE / HTTP-streaming 的客户端到服务端命令；
-- read / idle timeout 大于 Centrifugo ping 间隔（默认 25 秒），并留出余量；
-- 对外使用 TLS，对应客户端地址为 `wss://` 或 `https://`。
-
-Nginx 的关键片段：
-
-```nginx
-upstream centrifugo {
-    server centrifugo-1:8000;
-    server centrifugo-2:8000;
-}
-
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    ''      close;
-}
-
-server {
-    listen 443 ssl;
-    server_name realtime.example.com;
-
-    location /connection/ {
-        proxy_pass http://centrifugo;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_buffering off;
-        proxy_read_timeout 60s;
-        proxy_send_timeout 60s;
-    }
-
-    location / {
-        proxy_pass http://centrifugo;
-    }
-}
-```
-
-该片段只突出实时代理配置，实际还需补充证书、安全响应头、访问日志和内部 API 访问控制。
-
-### 9.2 Kubernetes
-
-- 至少两个 Centrifugo 副本，并跨可用区或节点分散。
-- 使用 Redis Engine，配置 PDB，避免自愿运维同时驱逐全部副本。
-- 滚动升级前验证代理排空、重连和恢复，而不只是检查 Pod Ready。
-- HPA 不应只看 CPU：长连接服务的连接数、内存、网络 egress、订阅数同样关键。
-- 扩容后连接不会天然均匀迁移；新连接会进入新 Pod，长期均衡需要结合重连策略观察。
-- 配置、令牌密钥和 API Key 使用 Secret 管理，生产镜像固定精确版本并走升级验证。
-- Redis 需要独立的高可用与故障切换方案；多 Centrifugo 副本并不能消除 Redis 单点。
-
-### 9.3 操作系统与容量
-
-每条连接都会消耗文件描述符；经过代理时，通常还同时消耗下游与上游连接。需要一起检查：
-
-- Centrifugo 与 Nginx / HAProxy / Envoy 的 `nofile`；
-- 代理最大连接数；
-- LB 与节点间的临时端口范围和 TIME_WAIT；
-- 内核 conntrack 容量；
-- 单节点连接数、每连接订阅数、消息大小和广播扇出。
-
-一个简单估算思路：
-
-```text
-节点内存 ≈ 连接数 × 单连接成本 + 订阅数 × 单订阅成本 + 历史/缓冲开销
-出口带宽 ≈ 发布速率 × 平均消息线上大小 × 平均订阅者扇出
-```
-
-实际数值必须压测得到。特别要模拟“大 channel 广播”和“集中重连”，因为平均 QPS 很低并不代表系统没有瞬时风险。
-
-## 10. 可观测性与故障排查
-
-开启 Prometheus：
-
-```json
-{
-  "prometheus": {
-    "enabled": true
-  }
-}
-```
-
-重点关注以下信号，而不是只看进程是否存活：
-
-| 领域 | 代表指标 / 现象 |
-| --- | --- |
-| 连接与订阅 | `centrifugo_node_num_clients`、`centrifugo_node_num_subscriptions`、连接接受数、异常断开数 |
-| 实时投递 | `centrifugo_node_pub_sub_lag_seconds`、broadcast 延迟、transport 发送速率与字节数 |
-| 恢复效果 | `centrifugo_client_recover{recovered="false"}` 增长、恢复 publication 数量 |
-| Redis | PUB/SUB errors、dropped messages、buffered messages，以及 Redis 自身 CPU / 内存 / 延迟 |
-| Server API | API 延迟、错误率、临时错误与重试 |
-| Proxy | `centrifugo_proxy_errors`、inflight requests、proxy 延迟 |
-| 系统 | RSS、CPU、文件描述符、网络、代理连接数、临时端口与 TIME_WAIT |
-
-常见故障可按链路定位：
-
-| 症状 | 优先检查 |
-| --- | --- |
-| 能连接但订阅报 `102` | namespace 未定义，或发布/订阅的完整 channel 名不一致 |
-| 订阅报 `103` | subscribe 权限未开放、订阅 JWT 不匹配、proxy 拒绝 |
-| 重连后 `recovered: false` | 历史窗口过小、TTL 到期、epoch 改变、Broker 数据丢失；应回源而非继续假设完整 |
-| 多节点只有部分客户端收到 | Engine 配置不一致、Redis 连通性、节点是否使用同一套 Broker 与 prefix |
-| 连接建立但 SSE 消息不及时 | 代理响应缓冲未关闭 |
-| 每隔固定时间断线 | 代理 / LB idle timeout 小于或过于接近 ping 间隔 |
-| 高并发下无法新建连接 | 文件描述符、代理 max connections、临时端口、conntrack |
-| 发布 HTTP 200 但无效果 | 检查响应体 `error`、channel 全名、订阅状态和 Broker 指标 |
-
-日志中不要记录完整 JWT、API Key 或敏感消息内容。
-
-## 11. 上线前验证清单
-
-### 功能与安全
-
-- [ ] 初次加载、实时增量、恢复失败回源三条路径都验证过。
-- [ ] 同一用户的多个连接、多个节点之间的广播正常。
-- [ ] 未登录、越权订阅、过期令牌、令牌刷新和撤销流程符合预期。
-- [ ] subscribe、publish、history、presence 分别做过权限测试。
-- [ ] Server API / Admin / Metrics 不暴露给不可信网络。
-- [ ] `allowed_origins`、TLS、密钥管理和密钥轮换经过验证。
-
-### 可靠性与性能
-
-- [ ] 消息有稳定 ID，消费者能处理重复和旧版本事件。
-- [ ] 明确每个 namespace 是否需要 history、recovery、presence，没有无差别全开。
-- [ ] DB 提交后发布失败的处理方式明确：可回源、重试或 Outbox。
-- [ ] 压测覆盖大 channel 广播、热点 channel、消息大小分布和大量订阅。
-- [ ] 演练单节点重启、滚动升级、Redis 故障切换、网络分区和集中重连。
-- [ ] 代理 buffering、WebSocket upgrade、`/emulation`、idle timeout 均经过端到端测试。
-- [ ] 监控、告警、Grafana 面板和客户端回源指标可用。
-
-## 12. 一句话总结
-
-Centrifugo 的价值不只是“提供一个 WebSocket 服务”，而是把 **长连接生命周期、channel 订阅、跨节点广播、短期恢复和在线状态** 从业务系统中拆出来。落地时真正决定系统可靠性的，是以下组合：
-
-> **后端主导业务写入 + 数据库作为事实源 + Redis 支撑多节点 + 有界历史处理短断线 + `recovered: false` 回源 + 全链路幂等与可观测性。**
-
-## 参考资料
-
-- [Design overview](https://centrifugal.dev/docs/getting-started/design)
-- [Channels and namespaces](https://centrifugal.dev/docs/server/channels)
-- [Channel permission model](https://centrifugal.dev/docs/server/channel_permissions)
-- [Client JWT authentication](https://centrifugal.dev/docs/server/authentication)
-- [Engines and scalability](https://centrifugal.dev/docs/server/engines)
-- [Stream history and recovery](https://centrifugal.dev/docs/server/history_and_recovery)
-- [Server API walkthrough](https://centrifugal.dev/docs/server/server_api)
-- [Client SDK specification](https://centrifugal.dev/docs/transports/client_api)
-- [Built-in API command async consumers](https://centrifugal.dev/docs/server/consumers)
-- [Load balancing and proxying](https://centrifugal.dev/docs/server/load_balancing)
-- [Infrastructure tuning](https://centrifugal.dev/docs/server/infra_tuning)
-- [Server observability](https://centrifugal.dev/docs/server/observability)
+- 上游：[[平台组件]] · [[云原生]]
+- 项目用法：[[Centrifugo项目实战]]（NAT 穿透门铃/隧道/presence 门禁）
+- 持久消费分工：[[Kafka]]
+- 官方文档（v5）：[配置](https://centrifugal.dev/docs/5/server/configuration) · [Server API](https://centrifugal.dev/docs/server/server_api) · [频道](https://centrifugal.dev/docs/5/server/channels) · [JWT](https://centrifugal.dev/docs/5/server/authentication)
